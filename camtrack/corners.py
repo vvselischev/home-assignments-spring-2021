@@ -51,13 +51,12 @@ def _build_impl(frame_sequence: pims.FramesSequence,
     N = 5000
     block_size = 7
     quality = 0.01
-    min_distance = 10
+    min_distance = 8
     win_size = (15, 15)
     max_level = 2
     criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 0.03)
 
-    feature_params = dict(maxCorners=N,
-                          qualityLevel=quality,
+    feature_params = dict(qualityLevel=quality,
                           minDistance=min_distance,
                           blockSize=block_size)
     lk_params = dict(winSize=win_size,
@@ -65,7 +64,7 @@ def _build_impl(frame_sequence: pims.FramesSequence,
                      criteria=criteria)
 
     image_0 = frame_sequence[0]
-    old_frame_corners = cv2.goodFeaturesToTrack(image_0, mask=None, **feature_params)
+    old_frame_corners = cv2.goodFeaturesToTrack(image_0, mask=None, maxCorners=N, **feature_params)
     old_corners = FrameCorners(
         np.array([i for i in range(len(old_frame_corners))]),
         old_frame_corners,
@@ -77,17 +76,28 @@ def _build_impl(frame_sequence: pims.FramesSequence,
     builder.set_corners_at_frame(0, old_corners)
 
     for frame, image_1 in enumerate(frame_sequence[1:], 1):
-        new_frame_corners = cv2.goodFeaturesToTrack(image_1.astype(np.float32), mask=None, **feature_params)
-        new_frame_corners = np.array([[x[0][0], x[0][1]] for x in new_frame_corners])
-
         image_1 = (image_1 * 256).astype(np.uint8)
         new_corners, status, err = cv2.calcOpticalFlowPyrLK(image_0, image_1, old_frame_corners, None, **lk_params)
 
         good_new = new_corners[status == 1]
+        size = len(good_new)
 
-        good_new = np.concatenate((good_new, new_frame_corners))
-        size = min(N, len(good_new))
-        good_new = good_new[:size]
+        if len(good_new) < N:
+            mask = np.ones_like(image_1)
+            for new_corner in good_new:
+                x = new_corner[0]
+                y = new_corner[1]
+                mask = cv2.circle(mask, (int(round(x)), int(round(y))), radius=min_distance, color=0,
+                                  thickness=cv2.FILLED)
+
+            delta = N - len(good_new)
+            new_frame_corners = cv2.goodFeaturesToTrack(image_1.astype(np.float32), maxCorners=delta,
+                                                        mask=mask, **feature_params)
+            if new_frame_corners is not None:
+                new_frame_corners = np.array([[x[0][0], x[0][1]] for x in new_frame_corners])
+                good_new = np.concatenate((good_new, new_frame_corners))
+                size = min(N, len(good_new))
+                good_new = good_new[:size]
 
         ids = np.array([old_corners.ids[i][0] for i in range(len(status)) if status[i] == 1], dtype=np.int32)
         old_len = len(ids)
