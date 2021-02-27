@@ -66,7 +66,7 @@ def _build_impl(frame_sequence: pims.FramesSequence,
     image_0 = frame_sequence[0]
     old_frame_corners = cv2.goodFeaturesToTrack(image_0, mask=None, maxCorners=N, **feature_params)
     old_corners = FrameCorners(
-        np.array([i for i in range(len(old_frame_corners))]),
+        np.array([i for i in range(len(old_frame_corners))], dtype=np.int64),
         old_frame_corners,
         np.array([block_size] * len(old_frame_corners))
     )
@@ -99,9 +99,9 @@ def _build_impl(frame_sequence: pims.FramesSequence,
                 size = min(N, len(good_new))
                 good_new = good_new[:size]
 
-        ids = np.array([old_corners.ids[i][0] for i in range(len(status)) if status[i] == 1], dtype=np.int32)
+        ids = np.array([old_corners.ids[i][0] for i in range(len(status)) if status[i] == 1], dtype=np.int64)
         old_len = len(ids)
-        new_ids = np.array([i for i in range(last_id + 1, last_id + 1 + size - old_len)], dtype=np.int32)
+        new_ids = np.array([i for i in range(last_id + 1, last_id + 1 + size - old_len)], dtype=np.int64)
         last_id = last_id + size - old_len
         ids = np.concatenate((ids, new_ids))
 
