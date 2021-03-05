@@ -6,13 +6,12 @@ moviepy<1.0.0
 numpy
 pyquaternion
 pyyaml
-recordclass
 scikit-image
 scikit-learn
 scipy
 transforms3d
-recordclass
 pims
 PyOpenGL
 sortednp
 opencv-python
+#recordclass
