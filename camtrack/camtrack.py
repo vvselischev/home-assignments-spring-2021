@@ -25,13 +25,116 @@ from _camtrack import (
     triangulate_correspondences,
     TriangulationParameters,
     rodrigues_and_translation_to_view_mat3x4,
-    eye3x4
+    eye3x4,
+    compute_reprojection_errors
 )
 
 
-def solve_homogeneous(U):
-    e_vals, e_vecs = np.linalg.eig(np.dot(U.T, U))
-    return e_vecs[:, np.argmin(e_vals)]
+def init_camera(intrinsic_mat, corner_storage: CornerStorage):
+    threshold = 1
+    confidence = 0.99
+    reprojection_error = 2
+    min_angle = 1
+    max_iters = 300
+    essential_validation_threshold = 0.9
+    min_inliers = 10
+
+    frame_count = len(corner_storage)
+
+    best_view = None
+    best_global_error = 10000
+    best_first_frame = 0
+    best_second_frame = 1
+    init_view = np.hstack((np.eye(3), np.zeros((3, 1))))
+    steps = [i for i in range(4, 30)]
+
+
+    while True:
+        reprojection_error = min(8, reprojection_error + 1)
+        triangulation_parameters = TriangulationParameters(reprojection_error, min_angle, 0)
+
+        for first_frame in range(min(int(frame_count * 0.7), 150)):
+            for step in steps:
+                second_frame = first_frame - step
+                if second_frame < 0:
+                    break
+                print(f'{first_frame} / {frame_count}')
+                corrs = build_correspondences(corner_storage[first_frame], corner_storage[second_frame])
+                first_points = corrs.points_1
+                second_points = corrs.points_2
+                corr_ids = corrs.ids
+
+                essential_mat, essential_mask = cv2.findEssentialMat(first_points, second_points, intrinsic_mat,
+                                                                     method=cv2.RANSAC,
+                                                                     threshold=threshold,
+                                                                     prob=confidence)
+
+                homography, homography_mask = cv2.findHomography(first_points, second_points,
+                                                                 method=cv2.RANSAC,
+                                                                 ransacReprojThreshold=reprojection_error,
+                                                                 confidence=confidence,
+                                                                 maxIters=max_iters)
+
+                essential_mask = essential_mask.flatten()
+                homography_mask = homography_mask.flatten()
+
+                essential_first_inliers = first_points[essential_mask == 1]
+                essential_second_inliers = second_points[essential_mask == 1]
+
+                outlier_ids = corr_ids[essential_mask == 0]
+
+                homography_first_inliers = first_points[homography_mask == 1]
+
+                inlier_fraction = len(homography_first_inliers) / len(essential_first_inliers)
+
+                if inlier_fraction < essential_validation_threshold or len(essential_first_inliers) < min_inliers:
+                    continue
+
+                R1, R2, t = cv2.decomposeEssentialMat(essential_mat)
+                candidates = [np.hstack((R1, t)),
+                              np.hstack((R1, -t)),
+                              np.hstack((R2, t)),
+                              np.hstack((R2, -t))]
+
+                corrs = build_correspondences(corner_storage[first_frame], corner_storage[second_frame], outlier_ids)
+
+                best_candidate = None
+                best_points_count = 0
+
+                for candidate_view in candidates:
+                    points_3d, ids, _ = triangulate_correspondences(
+                        corrs, init_view, candidate_view, intrinsic_mat, triangulation_parameters)
+                    if len(points_3d) > best_points_count and len(points_3d) > min_inliers:
+                        best_candidate = candidate_view
+                        best_points_count = len(points_3d)
+
+                if best_candidate is None:
+                    continue
+
+                points_3d, ids, _ = triangulate_correspondences(
+                    corrs, init_view, best_candidate, intrinsic_mat, triangulation_parameters)
+                ids = set([i for i in ids])
+                first_points_indices = [i for i in range(len(corner_storage[first_frame].ids))
+                                        if corner_storage[first_frame].ids[i][0] in ids]
+                second_points_indices = [i for i in range(len(corner_storage[second_frame].ids))
+                                        if corner_storage[second_frame].ids[i][0] in ids]
+                sum_error = compute_reprojection_errors(points_3d, corner_storage[first_frame].points[first_points_indices],
+                                                        intrinsic_mat @ init_view) + \
+                            compute_reprojection_errors(points_3d, corner_storage[second_frame].points[second_points_indices],
+                                                        intrinsic_mat @ best_candidate)
+                current_error = np.mean(sum_error)
+
+                if current_error > 1 or np.linalg.norm(best_candidate[:, 3]) < 0.9:
+                    continue
+
+                if best_candidate is not None and current_error < best_global_error:
+                    best_global_error = current_error
+                    best_view = best_candidate
+                    best_first_frame = first_frame
+                    best_second_frame = second_frame
+
+        if best_view is not None:
+            return best_first_frame, best_second_frame, init_view, best_view, reprojection_error, min_angle
 
 
 def track_and_calc_colors(camera_parameters: CameraParameters,
@@ -40,25 +143,26 @@ def track_and_calc_colors(camera_parameters: CameraParameters,
                           known_view_1: Optional[Tuple[int, Pose]] = None,
                           known_view_2: Optional[Tuple[int, Pose]] = None) \
         -> Tuple[List[Pose], PointCloud]:
-    if known_view_1 is None or known_view_2 is None:
-        raise NotImplementedError()
-
     rgb_sequence = frameseq.read_rgb_f32(frame_sequence_path)
     intrinsic_mat = to_opencv_camera_mat3x3(
         camera_parameters,
         rgb_sequence[0].shape[0]
     )
 
-    max_reprojection_error = 5
-    min_angle = 5
-    start_triangulation_parameters = TriangulationParameters(7, 0, 0)
-    triangulation_parameters = TriangulationParameters(max_reprojection_error, min_angle, 0)
+    if known_view_1 is None or known_view_2 is None:
+        first_frame, second_frame, first_view, second_view, max_reprojection_error, min_angle = \
+            init_camera(intrinsic_mat, corner_storage)
+        print(f'Using frames: {first_frame}, {second_frame}')
+    else:
+        first_view = pose_to_view_mat3x4(known_view_1[1])
+        second_view = pose_to_view_mat3x4(known_view_2[1])
+        first_frame = known_view_1[0]
+        second_frame = known_view_2[0]
+        max_reprojection_error = 5
+        min_angle = 2.2
 
-    first_view = pose_to_view_mat3x4(known_view_1[1])
-    second_view = pose_to_view_mat3x4(known_view_2[1])
-
-    first_frame = known_view_1[0]
-    second_frame = known_view_2[0]
+    start_triangulation_parameters = TriangulationParameters(4, 0, 0)
+    triangulation_parameters = TriangulationParameters(3, 0.8, 0)
 
     frame_corrs = build_correspondences(corner_storage[first_frame], corner_storage[second_frame])
     (points_3d, ids, median_cos) = triangulate_correspondences(
@@ -115,21 +219,25 @@ def track_and_calc_colors(camera_parameters: CameraParameters,
         points_2d = corner_storage[best_unknown_frame].points[best_ids_indices]
         points_3d = builder.points[best_3d_ids_indices]
 
-        if len(points_2d) < 6 or len(points_3d) < 6:
+        if len(points_2d) < 4 or len(points_3d) < 4:
             break
 
-        # sometimes I'm getting a strange exception about count(points) == 5 (expected 6)
-        # while the actual number of passed points is large
-        # however, that happens very rarely, so can ignore such frames
-        try:
-            retval, R, t, inliers = cv2.solvePnPRansac(points_3d,
-                                                       points_2d,
-                                                       intrinsic_mat,
-                                                       None,
-                                                       reprojectionError=max_reprojection_error)
-        except:
-            unknown_frames.remove(best_unknown_frame)
-            continue
+        retval, R, t, inliers = cv2.solvePnPRansac(points_3d,
+                                                   points_2d,
+                                                   intrinsic_mat,
+                                                   None,
+                                                   confidence=0.995,
+                                                   flags=cv2.SOLVEPNP_EPNP,
+                                                   reprojectionError=2)
+        if retval:
+            retval, R, t = cv2.solvePnP(points_3d[inliers.flatten()],
+                                        points_2d[inliers.flatten()],
+                                        intrinsic_mat,
+                                        None,
+                                        flags=cv2.SOLVEPNP_ITERATIVE,
+                                        useExtrinsicGuess=True,
+                                        rvec=R,
+                                        tvec=t)
 
         if not retval:
             unknown_frames.remove(best_unknown_frame)
@@ -137,7 +245,7 @@ def track_and_calc_colors(camera_parameters: CameraParameters,
 
         print(f'Processing frame {frame_count - len(unknown_frames)}/{frame_count}: '
               f'inliers count={len(inliers)}, '
-              f'cloud size={len(builder.ids)},'
+              f'cloud size={len(builder.ids)}, '
               f'used correspondences={len(points_2d)}', file=sys.stdout)
 
         # add the current view
@@ -157,8 +265,11 @@ def track_and_calc_colors(camera_parameters: CameraParameters,
                                                 to_delete)
             first_view = view_mats[known_frame]
             second_view = view_mats[best_unknown_frame]
-            (points_3d, ids, median_cos) = triangulate_correspondences(
-                frame_corrs, first_view, second_view, intrinsic_mat, triangulation_parameters)
+            try:
+                (points_3d, ids, median_cos) = triangulate_correspondences(
+                    frame_corrs, first_view, second_view, intrinsic_mat, triangulation_parameters)
+            except:
+                continue
 
             builder.add_points(ids, points_3d)
 
